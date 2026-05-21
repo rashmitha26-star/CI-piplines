@@ -1,31 +1,31 @@
-# CI Pipeline Project
+# CI/CD Pipeline Project
 
-A Java Spring Boot application with **CI (Continuous Integration)** pipeline.
+A Java Spring Boot application with separated **CI (Continuous Integration)** and **CD (Continuous Deployment)** pipelines.
 
 ## 🚀 Quick Start
 
-```bash
-# Push code to trigger CI
-git add .
-git commit -m "your changes"
-git push origin main
+**New to this project?** Start here: [QUICK-START.md](QUICK-START.md)
 
-# CI will automatically:
-# 1. Build and test
-# 2. Create Docker image
-# 3. Scan for vulnerabilities
-# 4. Push to GitHub Container Registry
-```
+## 📋 Project Status
+
+- ✅ **CI Pipeline** - Fully implemented and working
+- 🔜 **CD Pipeline** - Coming next
 
 ## 🏗️ Architecture
 
+### Current Setup (CI Only)
 ```
-Developer Push → CI Pipeline → Docker Image in GHCR → ArgoCD (separate repo)
+Developer Push → CI Pipeline → Docker Image in GHCR
                      ↓
               (Tests, Build, Scan)
 ```
 
-**Note:** CD (deployment) is handled by ArgoCD in a separate repository
+### Future Setup (CI + CD)
+```
+Developer Push → CI Pipeline → Docker Image → CD Pipeline → Kubernetes
+                     ↓                              ↓
+              (Tests, Build, Scan)        (Deploy, Blue-Green, Rollback)
+```
 
 ## 📁 Repository Structure
 
