@@ -1,0 +1,322 @@
+name: CI Pipeline - Build, Test & Publish
+
+on:
+  push:
+    branches: [ "main", "develop" ]
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  JAVA_VERSION: '17'
+
+jobs:
+  # ═══════════════════════════════════════════════════════════════
+  # JOB 1: BUILD AND TEST
+  # ═══════════════════════════════════════════════════════════════
+  build-and-test:
+    name: Build and Test Application
+    runs-on: ubuntu-latest
+    
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      image-tag: ${{ steps.image-tag.outputs.tag }}
+      
+    steps:
+      # ─────────────────────────────────────────────────────────
+      # STEP 1: CHECKOUT CODE
+      # ─────────────────────────────────────────────────────────
+      - name: 📥 Checkout Application Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full git history for versioning
+        
+      # ─────────────────────────────────────────────────────────
+      # STEP 2: SETUP JAVA
+      # ─────────────────────────────────────────────────────────
+      - name: ☕ Setup Java ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: 'maven'
+        
+      - name: 📊 Display Java Version
+        run: |
+          java -version
+          mvn -version
+        
+      # ─────────────────────────────────────────────────────────
+      # STEP 3: RUN UNIT TESTS
+      # ─────────────────────────────────────────────────────────
+      - name: 🧪 Run Unit Tests
+        run: mvn test -B
+        
+      - name: 📈 Publish Test Results
+        uses: dorny/test-reporter@v1
+        if: always()
+        with:
+          name: Maven Test Results
+          path: target/surefire-reports/*.xml
+          reporter: java-junit
+          fail-on-error: true
+        
+      - name: 📊 Generate Test Coverage Report
+        run: mvn jacoco:report
+        
+      # ─────────────────────────────────────────────────────────
+      # STEP 4: MAVEN BUILD
+      # ─────────────────────────────────────────────────────────
+      - name: 🔨 Build with Maven
+        run: mvn clean package -DskipTests -B
+        
+      - name: 📦 Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: application-jar
+          path: target/*.jar
+          retention-days: 5
+        
+      - name: 🏷️ Generate Version Tag
+        id: version
+        run: |
+          VERSION=$(mvn help:evaluate -Dexpression=project.version -q -DforceStdout)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Generated version: $VERSION"
+      
+      - name: 🏷️ Generate Image Tag
+        id: image-tag
+        run: |
+          # Use short SHA for image tag
+          IMAGE_TAG="${{ github.sha }}"
+          echo "tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+          echo "Image tag: ${IMAGE_TAG}"
+
+  # ═══════════════════════════════════════════════════════════════
+  # JOB 2: DOCKER BUILD AND SECURITY SCAN
+  # ═══════════════════════════════════════════════════════════════
+  docker-build-scan:
+    name: Docker Build and Security Scan
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    
+    permissions:
+      contents: read
+      packages: write
+      security-events: write
+      
+    outputs:
+      image-digest: ${{ steps.build.outputs.digest }}
+      image-tags: ${{ steps.meta.outputs.tags }}
+      
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+        
+      - name: 📦 Download Build Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: application-jar
+          path: target/
+        
+      - name: 🐳 Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        
+      - name: 🔐 Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+        
+      - name: 🏷️ Extract Docker Metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=,format=short
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=raw,value={{date 'YYYYMMDD-HHmmss'}}
+        
+      # ─────────────────────────────────────────────────────────
+      # DOCKER BUILD (WITHOUT PUSH - FOR SCANNING)
+      # ─────────────────────────────────────────────────────────
+      - name: 🏗️ Build Docker Image (for scanning)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          load: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            VERSION=${{ needs.build-and-test.outputs.version }}
+        
+      # ─────────────────────────────────────────────────────────
+      # SECURITY SCAN
+      # ─────────────────────────────────────────────────────────
+      - name: 🔍 Run Trivy Vulnerability Scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '1'
+          ignore-unfixed: true
+        
+      - name: 📤 Upload Trivy Results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+        
+      - name: 📊 Generate Trivy HTML Report
+        uses: aquasecurity/trivy-action@master
+        if: always()
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          format: 'template'
+          template: '@/contrib/html.tpl'
+          output: 'trivy-report.html'
+          
+      - name: 📤 Upload Trivy HTML Report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trivy-security-report
+          path: trivy-report.html
+        
+      # ─────────────────────────────────────────────────────────
+      # PUSH DOCKER IMAGE (AFTER SECURITY SCAN PASSES)
+      # ─────────────────────────────────────────────────────────
+      - name: 🚀 Push Docker Image to Registry
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          build-args: |
+            VERSION=${{ needs.build-and-test.outputs.version }}
+        
+      - name: 📝 Image Details
+        run: |
+          echo "## 🐳 Docker Image Published" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Registry:** ${{ env.REGISTRY }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Image:** ${{ env.IMAGE_NAME }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Tags:**" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "${{ steps.meta.outputs.tags }}" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "**Digest:** \`${{ steps.build.outputs.digest }}\`" >> $GITHUB_STEP_SUMMARY
+
+  # ═══════════════════════════════════════════════════════════════
+  # JOB 3: CI SUMMARY
+  # ═══════════════════════════════════════════════════════════════
+  ci-summary:
+    name: CI Pipeline Summary
+    runs-on: ubuntu-latest
+    needs: [build-and-test, docker-build-scan]
+    if: always()
+    
+    steps:
+      - name: 📊 Generate CI Summary
+        run: |
+          echo "## ✅ CI Pipeline Complete!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Stage | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Build & Test | ${{ needs.build-and-test.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Docker Build & Scan | ${{ needs.docker-build-scan.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📦 Artifacts" >> $GITHUB_STEP_SUMMARY
+          echo "- Application Version: \`${{ needs.build-and-test.outputs.version }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Image Tag: \`${{ needs.build-and-test.outputs.image-tag }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Registry: \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🎯 Next Steps" >> $GITHUB_STEP_SUMMARY
+          echo "- Image is ready for deployment" >> $GITHUB_STEP_SUMMARY
+          echo "- Trigger CD pipeline to deploy to environments" >> $GITHUB_STEP_SUMMARY
+          echo "- Review security scan results if any issues found" >> $GITHUB_STEP_SUMMARY
+      
+      - name: 💬 Comment on PR (if applicable)
+        uses: actions/github-script@v7
+        if: github.event_name == 'pull_request'
+        with:
+          script: |
+            const buildStatus = '${{ needs.build-and-test.result }}';
+            const dockerStatus = '${{ needs.docker-build-scan.result }}';
+            const version = '${{ needs.build-and-test.outputs.version }}';
+            const imageTag = '${{ needs.build-and-test.outputs.image-tag }}';
+            
+            const statusEmoji = (status) => status === 'success' ? '✅' : '❌';
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## 🔄 CI Pipeline Results
+              
+              | Stage | Status |
+              |-------|--------|
+              | Build & Test | ${statusEmoji(buildStatus)} ${buildStatus} |
+              | Docker Build & Scan | ${statusEmoji(dockerStatus)} ${dockerStatus} |
+              
+              **Artifacts:**
+              - 📦 Version: \`${version}\`
+              - 🏷️ Image Tag: \`${imageTag}\`
+              - 📍 Registry: \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}\`
+              
+              ${buildStatus === 'success' && dockerStatus === 'success' 
+                ? '✅ **Ready for deployment!** Image has been published and scanned.' 
+                : '⚠️ **Pipeline failed.** Please check the logs and fix issues before deploying.'}
+              
+              [View Full Run](${context.payload.repository.html_url}/actions/runs/${context.runId})
+              `
+            })
+
+  # ═══════════════════════════════════════════════════════════════
+  # JOB 4: NOTIFY ON FAILURE
+  # ═══════════════════════════════════════════════════════════════
+  notify-failure:
+    name: Notify on CI Failure
+    runs-on: ubuntu-latest
+    needs: [build-and-test, docker-build-scan]
+    if: failure()
+    
+    steps:
+      - name: 🚨 Send Failure Notification
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `🚨 CI Pipeline Failed: ${context.sha.substring(0, 7)}`,
+              body: `## CI Pipeline Failed
+              
+              **Commit:** ${context.sha}
+              **Branch:** ${context.ref}
+              **Actor:** @${context.actor}
+              **Workflow:** ${context.workflow}
+              
+              **Failed Jobs:**
+              - Build & Test: ${{ needs.build-and-test.result }}
+              - Docker Build & Scan: ${{ needs.docker-build-scan.result }}
+              
+              [View Failed Run](${context.payload.repository.html_url}/actions/runs/${context.runId})
+              
+              Please investigate and fix the issues before merging.`,
+              labels: ['ci-failure', 'bug']
+            })
