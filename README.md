@@ -155,3 +155,4 @@ Having issues? Check:
 - ArgoCD integration
 - Blue-green deployments
 - Automated rollbacks
+- helps to zero downtime
