@@ -53,7 +53,7 @@ jobs:
       - name: 🧪 Run Unit Tests
         run: mvn test -B
         
-      - name: � Generate Test Coverage Report
+      - name: 📈 Generate Test Coverage Report
         if: success() || failure()
         run: mvn jacoco:report
         
@@ -184,8 +184,7 @@ jobs:
         if: always()
         with:
           image-ref: ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
-          format: 'template'
-          template: '@/contrib/html.tpl'
+          format: 'html'
           output: 'trivy-report.html'
           
       - name: 📤 Upload Trivy HTML Report
