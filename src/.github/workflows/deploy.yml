@@ -1,0 +1,224 @@
+name: Build, Scan, and Deploy (GitOps Pattern)
+ 
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+ 
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  GITOPS_REPO: YOUR_USERNAME/blue-green-gitops  # ⚠️ CHANGE THIS to your GitOps repo (e.g., rashmithakl/blue-green-gitops)
+ 
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read         # Read application code
+      packages: write        # Push to container registry
+      security-events: write # Upload Trivy results
+ 
+    steps:
+      # ═══════════════════════════════════════════════════════════
+      # STEP 1: CHECKOUT APPLICATION CODE
+      # ═══════════════════════════════════════════════════════════
+      - name: Checkout application code
+        uses: actions/checkout@v4
+        with:
+          path: app
+        # WHY: Need source code to build Docker image
+        # Checkout to 'app' subdirectory to avoid conflicts with GitOps repo
+ 
+      # ═══════════════════════════════════════════════════════════
+      # STEP 2: SETUP DOCKER BUILDX
+      # ═══════════════════════════════════════════════════════════
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        # WHY: Enables multi-platform builds and build caching
+ 
+      # ═══════════════════════════════════════════════════════════
+      # STEP 3: LOGIN TO CONTAINER REGISTRY
+      # ═══════════════════════════════════════════════════════════
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+        # WHY: Must authenticate before pushing images
+        # GITHUB_TOKEN is auto-provided by GitHub Actions
+ 
+      # ═══════════════════════════════════════════════════════════
+      # STEP 4: EXTRACT METADATA AND BUILD IMAGE
+      # ═══════════════════════════════════════════════════════════
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=,format=short
+            type=ref,event=branch
+        # WHY: Generates proper tags for the image
+        # SHA tags are immutable and traceable
+      
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./app
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+        # WHY: Builds image from app directory and pushes to registry
+        # Uses GitHub Actions cache for faster builds
+ 
+      # ═══════════════════════════════════════════════════════════
+      # STEP 5: SECURITY SCANNING WITH TRIVY
+      # ═══════════════════════════════════════════════════════════
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
+          format: "sarif"
+          output: "trivy-results.sarif"
+          severity: "CRITICAL,HIGH"
+          exit-code: "0"  # Don't fail pipeline, just report
+        # WHY: Scans for vulnerabilities in the built image
+        # exit-code 0 means we report but don't block deployment
+ 
+      - name: Upload Trivy scan results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: "trivy-results.sarif"
+        # WHY: Makes vulnerabilities visible in GitHub Security tab
+ 
+      # ═══════════════════════════════════════════════════════════
+      # STEP 6: CHECKOUT GITOPS REPOSITORY
+      # ═══════════════════════════════════════════════════════════
+      - name: Checkout GitOps Repository
+        if: github.event_name == 'push'  # Only on push, not PRs
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.GITOPS_REPO }}
+          token: ${{ secrets.GITOPS_PAT }}
+          path: gitops
+          fetch-depth: 0
+        # WHY: Need to update Helm values in separate GitOps repo
+        # Uses GITOPS_PAT secret for authentication
+        # IMPORTANT: You must create this secret in your repo settings
+ 
+      # ═══════════════════════════════════════════════════════════
+      # STEP 7: INSTALL YQ FOR YAML MANIPULATION
+      # ═══════════════════════════════════════════════════════════
+      - name: Install yq
+        if: github.event_name == 'push'
+        run: |
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+        # WHY: Needed to update YAML values files programmatically
+ 
+      # ═══════════════════════════════════════════════════════════
+      # STEP 8: UPDATE HELM VALUES FOR BLUE-GREEN DEPLOYMENT
+      # ═══════════════════════════════════════════════════════════
+      - name: Update Helm Values for Blue-Green
+        if: github.event_name == 'push'
+        run: |
+          cd gitops/helm/charts
+          
+          # Determine current active environment
+          CURRENT=$(yq eval '.blueGreen.activeSlot' values-blue-green.yaml)
+          echo "📍 Current active slot: $CURRENT"
+          
+          # Determine which slot to update (the inactive one)
+          if [ "$CURRENT" == "blue" ]; then
+            NEW_SLOT="green"
+          else
+            NEW_SLOT="blue"
+          fi
+          
+          echo "🎯 Updating $NEW_SLOT slot with new image"
+          
+          # Get short SHA for image tag
+          SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-7)
+          
+          # Update the inactive slot with new image tag
+          yq eval -i ".blueGreen.${NEW_SLOT}.image.repository = \"${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}\"" values-blue-green.yaml
+          yq eval -i ".blueGreen.${NEW_SLOT}.image.tag = \"sha-${SHORT_SHA}\"" values-blue-green.yaml
+          yq eval -i ".blueGreen.${NEW_SLOT}.enabled = true" values-blue-green.yaml
+          yq eval -i ".blueGreen.${NEW_SLOT}.commitSha = \"${{ github.sha }}\"" values-blue-green.yaml
+          yq eval -i ".blueGreen.${NEW_SLOT}.deployedAt = \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"" values-blue-green.yaml
+          yq eval -i ".blueGreen.${NEW_SLOT}.deployedBy = \"github-actions\"" values-blue-green.yaml
+          
+          echo "✅ Updated $NEW_SLOT environment with image tag: sha-${SHORT_SHA}"
+          echo "NEW_SLOT=$NEW_SLOT" >> $GITHUB_ENV
+          echo "SHORT_SHA=$SHORT_SHA" >> $GITHUB_ENV
+        # WHY: Updates the inactive environment with the new image
+        # This follows blue-green pattern: deploy to inactive, test, then switch
+        # ArgoCD will detect this change and deploy automatically
+ 
+      # ═══════════════════════════════════════════════════════════
+      # STEP 9: COMMIT AND PUSH TO GITOPS REPOSITORY
+      # ═══════════════════════════════════════════════════════════
+      - name: Commit and Push GitOps Changes
+        if: github.event_name == 'push'
+        run: |
+          cd gitops
+          
+          git config user.name "GitHub Actions Bot"
+          git config user.email "actions@github.com"
+          
+          git add helm/charts/values-blue-green.yaml
+          
+          if git diff --staged --quiet; then
+            echo "⚠️  No changes to commit"
+          else
+            git commit -m "🚀 Deploy ${{ github.sha }} to ${{ env.NEW_SLOT }} environment
+
+            - Image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ env.SHORT_SHA }}
+            - Deployed to: ${{ env.NEW_SLOT }} slot
+            - Commit: ${{ github.sha }}
+            - Triggered by: ${{ github.actor }}
+            
+            [skip ci]"
+            
+            git push
+            echo "✅ Pushed changes to GitOps repository"
+          fi
+        # WHY: Commits the updated values to GitOps repo
+        # [skip ci] prevents infinite loop if GitOps repo has CI
+        # ArgoCD watches this repo and will auto-deploy
+ 
+      # ═══════════════════════════════════════════════════════════
+      # STEP 10: CREATE DEPLOYMENT SUMMARY
+      # ═══════════════════════════════════════════════════════════
+      - name: Create Deployment Summary
+        if: github.event_name == 'push'
+        run: |
+          echo "## 🚀 Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Image Details" >> $GITHUB_STEP_SUMMARY
+          echo "- **Registry**: \`${{ env.REGISTRY }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Image**: \`${{ env.IMAGE_NAME }}:sha-${{ env.SHORT_SHA }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Full Tag**: \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ env.SHORT_SHA }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Deployment Details" >> $GITHUB_STEP_SUMMARY
+          echo "- **Deployed to**: \`${{ env.NEW_SLOT }}\` environment (inactive)" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit SHA**: \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Triggered by**: @${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **GitOps Repo**: \`${{ env.GITOPS_REPO }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🎯 Next Steps" >> $GITHUB_STEP_SUMMARY
+          echo "1. **Wait for ArgoCD** to sync the changes (usually 1-3 minutes)" >> $GITHUB_STEP_SUMMARY
+          echo "2. **Test the deployment** at: \`https://${{ env.NEW_SLOT }}.myapp.example.com\`" >> $GITHUB_STEP_SUMMARY
+          echo "3. **Run smoke tests** to verify functionality" >> $GITHUB_STEP_SUMMARY
+          echo "4. **Switch traffic** by updating \`blueGreen.activeSlot\` to \`${{ env.NEW_SLOT }}\` in GitOps repo" >> $GITHUB_STEP_SUMMARY
+          echo "5. **Monitor** the production environment for issues" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🔄 Rollback" >> $GITHUB_STEP_SUMMARY
+          echo "If issues occur, switch back by setting \`blueGreen.activeSlot\` to the previous environment" >> $GITHUB_STEP_SUMMARY
+        # WHY: Provides clear summary of what was deployed and next steps
+        # Visible in GitHub Actions UI
